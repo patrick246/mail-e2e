@@ -1,36 +1,39 @@
 package config
 
 import (
-	"github.com/brumhard/alligotor"
 	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	MetricsPort uint16
-	Targets     []Target
+	MetricsPort uint16   `yaml:"metricsPort"`
+	Targets     []Target `yaml:"targets"`
 }
 
 type Target struct {
-	Name string
-	SMTP SMTPHost
-	IMAP IMAPHost
+	Name     string        `yaml:"name"`
+	SMTP     SMTPHost      `yaml:"smtp"`
+	IMAP     IMAPHost      `yaml:"imap"`
+	Interval time.Duration `yaml:"interval"`
 }
 
 type SMTPHost struct {
-	Hostname string
-	Port     uint16
-	Username string
-	Password string
-	From     string
-	To       string
+	Hostname string `yaml:"hostname"`
+	Port     uint16 `yaml:"port"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	From     string `yaml:"from"`
+	To       string `yaml:"to"`
 }
 
 type IMAPHost struct {
-	Hostname           string
-	Port               uint16
-	Username           string
-	Password           string
-	InsecureSkipVerify bool
+	Hostname           string `yaml:"hostname"`
+	Port               uint16 `yaml:"port"`
+	Username           string `yaml:"username"`
+	Password           string `yaml:"password"`
+	InsecureSkipVerify bool   `yaml:"insecureSkipVerify"`
 }
 
 func Get() (Config, error) {
@@ -38,16 +41,16 @@ func Get() (Config, error) {
 	if configFileLocation == "" {
 		configFileLocation = "/etc/mail-e2e/config.yaml"
 	}
-	cfgSource := alligotor.New(
-		alligotor.NewEnvSource("MAILE2E"),
-		alligotor.NewFlagsSource(),
-		alligotor.NewFilesSource(configFileLocation),
-	)
 
-	cfg := Config{
-		MetricsPort: 8080,
+	//nolint:mnd // default values
+	var cfg Config
+
+	configFile, err := os.Open(configFileLocation)
+	if err != nil {
+		return Config{}, nil
 	}
-	err := cfgSource.Get(&cfg)
+
+	err = yaml.NewDecoder(configFile).Decode(&cfg)
 	if err != nil {
 		return Config{}, err
 	}

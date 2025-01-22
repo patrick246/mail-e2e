@@ -2,25 +2,32 @@ package metrics
 
 import (
 	"context"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Server struct {
 	server http.Server
 }
 
-func NewServer(addr string) *Server {
+func NewServer(addr string, registry *prometheus.Registry) *Server {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		Registry:          registry,
+		EnableOpenMetrics: true,
+	}))
 	mux.HandleFunc("/.well-known/ready", func(writer http.ResponseWriter, request *http.Request) {
-		writer.WriteHeader(200)
+		writer.WriteHeader(http.StatusOK)
 	})
 
 	return &Server{
 		server: http.Server{
-			Handler: mux,
-			Addr:    addr,
+			Handler:           mux,
+			Addr:              addr,
+			ReadHeaderTimeout: 1 * time.Second,
 		},
 	}
 }

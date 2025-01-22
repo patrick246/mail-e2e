@@ -6,22 +6,28 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/smtp"
+	"text/template"
+	"time"
+
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-sasl"
 	"github.com/google/uuid"
+
 	"github.com/patrick246/mail-e2e/internal/config"
 	"github.com/patrick246/mail-e2e/internal/logging"
 	"github.com/patrick246/mail-e2e/internal/metrics"
-	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
-	"net/smtp"
-	"text/template"
-	"time"
 )
 
-var ErrShutdownTimeout = errors.New("shutdown timeout")
+var (
+	ErrShutdownTimeout  = errors.New("shutdown timeout")
+	ErrDuplicateMail    = errors.New("duplicate mail id")
+	ErrDeadlineExceeded = errors.New("deadline exceeded")
+)
 
+//nolint:gochecknoglobals // compile once, is constant
 var mailTemplate = template.Must(template.New("testmail").Parse(`To: {{ .To }}
 From: {{ .From }}
 Subject: {{ .Subject }}
@@ -30,71 +36,81 @@ X-Mail-E2E-ID: {{ .ID }}
 This is a mail for end-to-end monitoring. 
 `))
 
+const defaultInterval = 30 * time.Second
+
 type TargetMonitor struct {
-	target config.Target
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
-
-	inflightMails map[string]MailMetadata
+	target  *config.Target
+	cancel  context.CancelFunc
+	done    chan struct{}
+	metrics *metrics.Metrics
 }
 
-type MailMetadata struct {
-}
-
-func NewTargetMonitor(target config.Target) *TargetMonitor {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewTargetMonitor(target *config.Target, metrics *metrics.Metrics) *TargetMonitor {
 	return &TargetMonitor{
-		target: target,
-		ctx:    ctx,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		target:  target,
+		done:    make(chan struct{}),
+		metrics: metrics,
 	}
 }
 
-func (t *TargetMonitor) Start() {
+func (t *TargetMonitor) Start(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	t.cancel = cancel
+
 	log := logging.CreateLogger("target").With("target", t.target.Name)
+
+	interval := t.target.Interval
+
+	if interval == 0 {
+		interval = defaultInterval
+	}
+
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			close(t.done)
 			return
-		case <-time.After(30 * time.Second):
+		case <-time.After(interval):
 		}
 
-		mailId := uuid.New().String()
-		log.Debugw("starting e2e check", "id", mailId, "to", t.target.SMTP.To)
+		mailID := uuid.New().String()
+		log.Debug("starting e2e check", "id", mailID, "to", t.target.SMTP.To)
 
-		timer := prometheus.NewTimer(metrics.MailDelay.WithLabelValues(t.target.Name))
+		startTime := time.Now()
 
-		err := t.sendSingleMail(mailId, log)
-		metrics.MailSent.WithLabelValues(t.target.Name).Inc()
+		err := t.sendSingleMail(mailID, log)
+		t.metrics.IncMailSent(t.target.Name)
+
 		if err != nil {
-			metrics.MailSentError.WithLabelValues(t.target.Name).Inc()
+			t.metrics.IncMailSentError(t.target.Name)
 			continue
 		}
 
-		err = t.receiveMail(mailId, log)
-		metrics.MailReceived.WithLabelValues(t.target.Name).Inc()
+		err = t.receiveMail(mailID, log)
+		t.metrics.IncMailReceived(t.target.Name)
+
 		if err != nil {
-			metrics.MailReceivedError.WithLabelValues(t.target.Name).Inc()
+			t.metrics.IncMailReceivedError(t.target.Name)
 		}
 
-		log.Debugw("e2e check done", "id", mailId)
-		timer.ObserveDuration()
+		log.Debug("e2e check done", "id", mailID)
+		t.metrics.ObserveMailDelay(t.target.Name, time.Since(startTime))
 	}
 }
 
-func (t *TargetMonitor) sendSingleMail(mailId string, log *zap.SugaredLogger) error {
+func (t *TargetMonitor) sendSingleMail(mailID string, log *slog.Logger) error {
 	mailBody := bytes.Buffer{}
+
 	err := mailTemplate.Execute(&mailBody, map[string]string{
 		"To":      t.target.SMTP.To,
 		"From":    t.target.SMTP.From,
 		"Subject": "",
-		"ID":      mailId,
+		"ID":      mailID,
 	})
 	if err != nil {
-		log.Errorw("mail template error", "error", err)
+		log.Error("mail template error", "error", err)
 		return err
 	}
 
@@ -111,90 +127,133 @@ func (t *TargetMonitor) sendSingleMail(mailId string, log *zap.SugaredLogger) er
 		mailBody.Bytes(),
 	)
 	if err != nil {
-		log.Warnw("mail send error", "id", mailId, "to", t.target.SMTP.To, "error", err)
+		log.Warn("mail send error", "id", mailID, "to", t.target.SMTP.To, "error", err)
 		return err
 	}
+
 	return nil
 }
 
-func (t *TargetMonitor) receiveMail(mailId string, log *zap.SugaredLogger) (err error) {
+func (t *TargetMonitor) receiveMail(mailID string, log *slog.Logger) (err error) {
 	c, err := client.DialTLS(fmt.Sprintf("%s:%d", t.target.IMAP.Hostname, t.target.IMAP.Port), &tls.Config{
-		InsecureSkipVerify: t.target.IMAP.InsecureSkipVerify,
+		InsecureSkipVerify: t.target.IMAP.InsecureSkipVerify, //nolint:gosec // Yes, this might be insecure. It has insecure in the name.
 	})
 	if err != nil {
-		log.Errorw("connection error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "insecureSkipVerify", t.target.IMAP.InsecureSkipVerify)
+		log.Error("connection error",
+			"host", t.target.IMAP.Hostname,
+			"port", t.target.IMAP.Port,
+			"insecureSkipVerify", t.target.IMAP.InsecureSkipVerify,
+		)
+
 		return err
 	}
+
 	defer func() {
 		closeErr := c.Logout()
 		if err == nil && closeErr != nil {
-			log.Errorw("connection close error", "error", err)
+			log.Error("connection close error", "error", err)
 			err = closeErr
 		}
 	}()
 
 	err = c.Authenticate(sasl.NewPlainClient("", t.target.IMAP.Username, t.target.IMAP.Password))
 	if err != nil {
-		log.Errorw("login error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "username", t.target.IMAP.Username)
+		log.Error("login error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "username", t.target.IMAP.Username)
 		return err
 	}
 
 	inbox, err := c.Select(imap.InboxName, false)
 	if err != nil {
-		log.Errorw("select error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "username", t.target.IMAP.Username, "mailbox", imap.InboxName)
+		log.Error(
+			"select error",
+			"host", t.target.IMAP.Hostname,
+			"port", t.target.IMAP.Port,
+			"username", t.target.IMAP.Username,
+			"mailbox", imap.InboxName,
+		)
+
 		return err
 	}
 
-	log.Infow("inbox state", "messages", inbox.Messages)
+	log.Info("inbox state", "messages", inbox.Messages)
 
-	criteria := imap.NewSearchCriteria()
-	criteria.Header.Set("X-Mail-E2E-ID", mailId)
+	interval := t.target.Interval
+	if interval == 0 {
+		interval = defaultInterval
+	}
 
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(interval)
 	for time.Now().Before(deadline) {
-		log.Infow("searching mail", "deadline", deadline.Format(time.RFC3339), "remaining", deadline.Sub(time.Now()).String())
-
-		seqNums, err := c.Search(criteria)
+		found, err := t.searchMail(c, log, deadline, mailID)
 		if err != nil {
-			log.Errorw("search error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "id", mailId, "error", err)
-			return err
+			log.Error("mailbox search error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port)
 		}
 
-		if len(seqNums) == 0 {
+		if !found {
 			time.Sleep(1 * time.Second)
+
 			continue
-		}
-		if len(seqNums) > 1 {
-			log.Errorw("duplicate mail id", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port)
-			return errors.New("duplicate mail id")
-		}
-
-		seqSet := imap.SeqSet{}
-		seqSet.AddNum(seqNums...)
-		err = c.Store(&seqSet, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{imap.DeletedFlag}, nil)
-		if err != nil {
-			log.Errorw("mail delete error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "error", err)
-			return err
-		}
-
-		err = c.Expunge(nil)
-		if err != nil {
-			log.Errorw("expunge error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "error", err)
-			return err
 		}
 
 		err = t.cleanMailbox(c)
 		if err != nil {
-			log.Errorw("mailbox clean error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "error", err)
+			log.Error("mailbox clean error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "error", err)
 		}
+
 		return nil
 	}
-	return errors.New("deadline exceeded")
+
+	return ErrDeadlineExceeded
+}
+
+func (t *TargetMonitor) searchMail(
+	c *client.Client, log *slog.Logger, deadline time.Time, mailID string,
+) (bool, error) {
+	log.Info("searching mail",
+		"deadline", deadline.Format(time.RFC3339),
+		"remaining", time.Until(deadline).String(),
+	)
+
+	criteria := imap.NewSearchCriteria()
+	criteria.Header.Set("X-Mail-E2E-ID", mailID)
+
+	seqNums, err := c.Search(criteria)
+	if err != nil {
+		log.Error("search error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "id", mailID, "error", err)
+		return false, err
+	}
+
+	if len(seqNums) == 0 {
+		return false, nil
+	}
+
+	if len(seqNums) > 1 {
+		log.Error("duplicate mail id", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port)
+		return false, ErrDuplicateMail
+	}
+
+	seqSet := imap.SeqSet{}
+	seqSet.AddNum(seqNums...)
+
+	err = c.Store(&seqSet, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{imap.DeletedFlag}, nil)
+	if err != nil {
+		log.Error("mail delete error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "error", err)
+		return false, err
+	}
+
+	err = c.Expunge(nil)
+	if err != nil {
+		log.Error("expunge error", "host", t.target.IMAP.Hostname, "port", t.target.IMAP.Port, "error", err)
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (t *TargetMonitor) cleanMailbox(c *client.Client) error {
 	criteria := imap.NewSearchCriteria()
 	criteria.SentBefore = time.Now().Add(-5 * time.Minute)
+
 	seqNums, err := c.Search(criteria)
 	if err != nil {
 		return err
@@ -216,6 +275,7 @@ func (t *TargetMonitor) cleanMailbox(c *client.Client) error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 

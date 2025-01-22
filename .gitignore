@@ -15,3 +15,5 @@
 # vendor/
 
 config.yaml
+*.iml
+.idea

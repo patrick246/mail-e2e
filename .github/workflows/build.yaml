@@ -2,9 +2,13 @@ name: Build
 
 on:
   push:
-    branches: [ $default-branch ]
+    branches:
+      - main
+    tags:
+      - v*
   pull_request:
-    branches: [ $default-branch ]
+    branches:
+      - main
   workflow_dispatch:
 
 env:

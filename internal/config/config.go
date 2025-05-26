@@ -1,7 +1,9 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -53,6 +55,20 @@ func Get() (Config, error) {
 	err = yaml.NewDecoder(configFile).Decode(&cfg)
 	if err != nil {
 		return Config{}, err
+	}
+
+	replacer := strings.NewReplacer(
+		".", "_",
+		"-", "_",
+	)
+
+	for i := range cfg.Targets {
+		if value, ok := os.LookupEnv(fmt.Sprintf("MAILE2E_TARGET_%s_SMTP_PASSWORD", strings.ToUpper(replacer.Replace(cfg.Targets[i].Name)))); ok {
+			cfg.Targets[i].SMTP.Password = value
+		}
+		if value, ok := os.LookupEnv(fmt.Sprintf("MAILE2E_TARGET_%s_IMAP_PASSWORD", strings.ToUpper(replacer.Replace(cfg.Targets[i].Name)))); ok {
+			cfg.Targets[i].IMAP.Password = value
+		}
 	}
 
 	return cfg, nil

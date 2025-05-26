@@ -1,5 +1,5 @@
-ARG GO_VERSION=1.21.4
-FROM golang:$GO_VERSION as builder
+ARG GO_VERSION=1.24.0
+FROM golang:$GO_VERSION AS builder
 ENV CGO_ENABLED=0
 WORKDIR /app
 COPY go.mod go.sum ./

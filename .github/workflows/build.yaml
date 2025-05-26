@@ -70,6 +70,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{raw}}
+            type=edge,branch=main
 
       - name: Build and push Docker image
         id: build-and-push
